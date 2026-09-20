@@ -13,8 +13,28 @@ namespace DeclutterAssets.Editor
         private static int s_AssetsFolderId = 0;
         private static bool s_InitializedExpanded = false;
 
+        public static bool SuppressAssetsExpansion { get; set; } = false;
+
         // Cache of imported TreeViewItems so they persist even when Assets is collapsed
         private static readonly Dictionary<string, TreeViewItem> s_CachedImportItems = new Dictionary<string, TreeViewItem>(StringComparer.OrdinalIgnoreCase);
+
+        public static int GetAssetsFolderId()
+        {
+            if (s_AssetsFolderId == 0)
+            {
+                var assetsObj = AssetDatabase.LoadAssetAtPath<UnityEngine.Object>("Assets");
+                if (assetsObj != null)
+                {
+                    s_AssetsFolderId = assetsObj.GetInstanceID();
+                }
+            }
+            return s_AssetsFolderId;
+        }
+
+        public static void ClearCache()
+        {
+            s_CachedImportItems.Clear();
+        }
 
         public static void SetImportsExpandedPref(bool expanded)
         {
@@ -30,24 +50,12 @@ namespace DeclutterAssets.Editor
                 object treeData = DeclutterAssetsUtility.GetTreeData(folderTree);
                 if (treeData == null) return false;
 
-                if (DeclutterAssetsUtility.GetNeedRefreshRows(treeData))
-                {
-                    return true;
-                }
-
                 TreeViewItem rootItem = DeclutterAssetsUtility.GetRootItem(treeData);
                 if (rootItem == null) return true;
 
-                if (s_AssetsFolderId == 0)
-                {
-                    var assetsObj = AssetDatabase.LoadAssetAtPath<UnityEngine.Object>("Assets");
-                    if (assetsObj != null)
-                    {
-                        s_AssetsFolderId = assetsObj.GetInstanceID();
-                    }
-                }
+                int assetsId = GetAssetsFolderId();
 
-                if (rootItem.id == s_AssetsFolderId || string.Equals(rootItem.displayName, "Assets", StringComparison.OrdinalIgnoreCase))
+                if (rootItem.id == assetsId || string.Equals(rootItem.displayName, "Assets", StringComparison.OrdinalIgnoreCase))
                 {
                     return true;
                 }
@@ -251,7 +259,7 @@ namespace DeclutterAssets.Editor
                     }
                     else
                     {
-                        itemNode = CreateItemFromPath(path, importsItem.depth + 1);
+                        itemNode = CreateItemFromPath(path, importsItem.depth + 1, foldersOnly: false);
                         if (itemNode != null)
                         {
                             s_CachedImportItems[path] = itemNode;
@@ -279,10 +287,18 @@ namespace DeclutterAssets.Editor
                     rootChildren.Insert(insertIndex, importsItem);
                 }
 
+                // Register Imports in DataSource (AssetsTreeViewDataSource) so Unity's native SetExpandedWithChildren recognizes it!
+                DeclutterAssetsUtility.RegisterImportsRootInDataSource(treeData, importsItem);
+
                 // 5. Manage expansion state (respect user's manual fold/unfold choice!)
                 TreeViewState state = DeclutterAssetsUtility.GetTreeState(folderTree);
                 if (state != null && state.expandedIDs != null)
                 {
+                    if (SuppressAssetsExpansion && s_AssetsFolderId != 0)
+                    {
+                        state.expandedIDs.Remove(s_AssetsFolderId);
+                    }
+
                     if (!s_InitializedExpanded)
                     {
                         bool shouldBeExpanded = EditorPrefs.GetBool(PrefsKeyExpanded, true);
@@ -301,7 +317,8 @@ namespace DeclutterAssets.Editor
                 // 6. Rebuild visible flat rows cache
                 var newRows = new List<TreeViewItem>();
                 List<int> expandedList = state != null ? state.expandedIDs : null;
-                BuildRowsRecursive(rootItem, expandedList, newRows);
+                bool isFoldersOnly = DeclutterAssetsUtility.IsFoldersOnly(treeData);
+                BuildRowsRecursive(rootItem, expandedList, newRows, isFoldersOnly);
 
                 DeclutterAssetsUtility.SetRows(treeData, newRows);
                 DeclutterAssetsUtility.SetNeedRefreshRows(treeData, false);
@@ -316,7 +333,35 @@ namespace DeclutterAssets.Editor
             }
         }
 
-        private static TreeViewItem CreateItemFromPath(string path, int depth)
+        private static bool HasNonMetaFiles(string dirPath)
+        {
+            try
+            {
+                if (!Directory.Exists(dirPath)) return false;
+                var files = Directory.GetFiles(dirPath);
+                for (int i = 0; i < files.Length; i++)
+                {
+                    if (!files[i].EndsWith(".meta", StringComparison.OrdinalIgnoreCase))
+                        return true;
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        private static bool HasChildContent(string dirPath, bool foldersOnly)
+        {
+            try
+            {
+                if (!Directory.Exists(dirPath)) return false;
+                if (Directory.GetDirectories(dirPath).Length > 0) return true;
+                if (!foldersOnly && HasNonMetaFiles(dirPath)) return true;
+            }
+            catch { }
+            return false;
+        }
+
+        private static TreeViewItem CreateItemFromPath(string path, int depth, bool foldersOnly = false)
         {
             try
             {
@@ -338,7 +383,11 @@ namespace DeclutterAssets.Editor
 
                 if (Directory.Exists(path))
                 {
-                    PopulateDirectoryChildren(item, path);
+                    PopulateDirectoryChildren(item, path, foldersOnly);
+                }
+                else
+                {
+                    item.children = new List<TreeViewItem>();
                 }
 
                 return item;
@@ -349,7 +398,7 @@ namespace DeclutterAssets.Editor
             }
         }
 
-        private static void PopulateDirectoryChildren(TreeViewItem parentItem, string dirPath)
+        private static void PopulateDirectoryChildren(TreeViewItem parentItem, string dirPath, bool foldersOnly = false)
         {
             if (!Directory.Exists(dirPath)) return;
 
@@ -361,25 +410,34 @@ namespace DeclutterAssets.Editor
                 for (int i = 0; i < subDirs.Length; i++)
                 {
                     string subPath = subDirs[i].Replace('\\', '/');
-                    var subItem = CreateItemFromPath(subPath, parentItem.depth + 1);
+                    var subItem = CreateItemFromPath(subPath, parentItem.depth + 1, foldersOnly);
                     if (subItem != null)
                     {
                         subItem.parent = parentItem;
+                        bool hasContent = HasChildContent(subPath, foldersOnly);
+                        if (hasContent && (subItem.children == null || subItem.children.Count == 0))
+                        {
+                            subItem.children = new List<TreeViewItem> { null };
+                        }
                         parentItem.children.Add(subItem);
                     }
                 }
 
-                var files = Directory.GetFiles(dirPath);
-                for (int i = 0; i < files.Length; i++)
+                if (!foldersOnly)
                 {
-                    string filePath = files[i].Replace('\\', '/');
-                    if (filePath.EndsWith(".meta", StringComparison.OrdinalIgnoreCase)) continue;
-
-                    var fileItem = CreateItemFromPath(filePath, parentItem.depth + 1);
-                    if (fileItem != null)
+                    var files = Directory.GetFiles(dirPath);
+                    for (int i = 0; i < files.Length; i++)
                     {
-                        fileItem.parent = parentItem;
-                        parentItem.children.Add(fileItem);
+                        string filePath = files[i].Replace('\\', '/');
+                        if (filePath.EndsWith(".meta", StringComparison.OrdinalIgnoreCase)) continue;
+
+                        var fileItem = CreateItemFromPath(filePath, parentItem.depth + 1, foldersOnly);
+                        if (fileItem != null)
+                        {
+                            fileItem.parent = parentItem;
+                            fileItem.children = new List<TreeViewItem>();
+                            parentItem.children.Add(fileItem);
+                        }
                     }
                 }
             }
@@ -404,7 +462,129 @@ namespace DeclutterAssets.Editor
             }
         }
 
-        private static void BuildRowsRecursive(TreeViewItem parent, List<int> expandedIDs, List<TreeViewItem> rows)
+        private static bool ShouldPopulateFolderChildren(TreeViewItem folderItem, bool foldersOnly)
+        {
+            if (folderItem == null) return false;
+            if (folderItem.children == null) return true;
+            if (folderItem.children.Count == 1 && folderItem.children[0] == null) return true;
+
+            // If empty, check if it actually has content on disk
+            if (folderItem.children.Count == 0)
+            {
+                string path = AssetDatabase.GetAssetPath(folderItem.id);
+                if (!string.IsNullOrEmpty(path) && Directory.Exists(path))
+                {
+                    bool isUnderImports = IsDescendantOfImports(folderItem);
+                    bool allowFiles = !foldersOnly || isUnderImports;
+                    if (HasChildContent(path, !allowFiles))
+                    {
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        public static bool IsDescendantOfImports(TreeViewItem item)
+        {
+            var current = item;
+            while (current != null)
+            {
+                if (current.id == DeclutterAssetsUtility.IMPORTS_ROOT_ID)
+                    return true;
+                current = current.parent;
+            }
+            return false;
+        }
+
+        private static void PopulateFolderChildrenIfLazy(TreeViewItem folderItem, bool foldersOnly = false)
+        {
+            if (folderItem == null) return;
+
+            string folderPath = AssetDatabase.GetAssetPath(folderItem.id);
+            if (string.IsNullOrEmpty(folderPath) || !Directory.Exists(folderPath)) return;
+
+            try
+            {
+                var settings = DeclutterAssetsSettings.Instance;
+                var validChildren = new List<TreeViewItem>();
+                bool isUnderImports = IsDescendantOfImports(folderItem);
+                bool allowFiles = !foldersOnly || isUnderImports;
+
+                // 1. Subdirectories
+                var subDirs = Directory.GetDirectories(folderPath);
+                for (int i = 0; i < subDirs.Length; i++)
+                {
+                    string subDir = subDirs[i].Replace('\\', '/');
+                    if (!isUnderImports && settings.IsImport(subDir)) continue;
+
+                    var assetObj = AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(subDir);
+                    int id = assetObj != null ? assetObj.GetInstanceID() : 0;
+                    if (id == 0) continue;
+
+                    string name = Path.GetFileName(subDir);
+                    var subItem = new TreeViewItem(id, folderItem.depth + 1, name);
+                    subItem.parent = folderItem;
+
+                    Texture2D icon = AssetDatabase.GetCachedIcon(subDir) as Texture2D;
+                    if (icon == null)
+                    {
+                        icon = DeclutterAssetsUtility.GetImportsFolderIcon();
+                    }
+                    subItem.icon = icon;
+
+                    bool hasContent = HasChildContent(subDir, !allowFiles);
+                    if (hasContent)
+                    {
+                        subItem.children = new List<TreeViewItem> { null }; // Lazy marker so foldout arrow renders
+                    }
+                    else
+                    {
+                        subItem.children = new List<TreeViewItem>();
+                    }
+
+                    validChildren.Add(subItem);
+                }
+
+                // 2. Files (always populate for folders under Imports, or when !foldersOnly)
+                if (allowFiles)
+                {
+                    var files = Directory.GetFiles(folderPath);
+                    for (int i = 0; i < files.Length; i++)
+                    {
+                        string filePath = files[i].Replace('\\', '/');
+                        if (filePath.EndsWith(".meta", StringComparison.OrdinalIgnoreCase)) continue;
+
+                        var assetObj = AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(filePath);
+                        int id = assetObj != null ? assetObj.GetInstanceID() : 0;
+                        if (id == 0) continue;
+
+                        string fileName = Path.GetFileName(filePath);
+                        var fileItem = new TreeViewItem(id, folderItem.depth + 1, fileName);
+                        fileItem.parent = folderItem;
+
+                        Texture2D icon = AssetDatabase.GetCachedIcon(filePath) as Texture2D;
+                        if (icon == null)
+                        {
+                            icon = EditorGUIUtility.ObjectContent(assetObj, typeof(UnityEngine.Object)).image as Texture2D;
+                        }
+                        fileItem.icon = icon;
+                        fileItem.children = new List<TreeViewItem>();
+
+                        validChildren.Add(fileItem);
+                    }
+                }
+
+                folderItem.children = validChildren;
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[DeclutterAssets] Failed to populate children for {folderPath}: {ex.Message}");
+            }
+        }
+
+        private static void BuildRowsRecursive(TreeViewItem parent, List<int> expandedIDs, List<TreeViewItem> rows, bool foldersOnly = false)
         {
             if (parent == null || parent.children == null) return;
 
@@ -417,9 +597,14 @@ namespace DeclutterAssets.Editor
 
                 if (expandedIDs != null && expandedIDs.Contains(child.id))
                 {
+                    if (ShouldPopulateFolderChildren(child, foldersOnly))
+                    {
+                        PopulateFolderChildrenIfLazy(child, foldersOnly);
+                    }
+
                     if (child.children != null && child.children.Count > 0)
                     {
-                        BuildRowsRecursive(child, expandedIDs, rows);
+                        BuildRowsRecursive(child, expandedIDs, rows, foldersOnly);
                     }
                 }
             }

@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using UnityEditor;
+using UnityEditor.IMGUI.Controls;
 using UnityEngine;
 using UnityEngine.UIElements;
 
@@ -16,9 +18,9 @@ namespace DeclutterAssets.Editor
             public DeclutterAssetsDragDrop DragDrop;
             public Action<int, Rect> CombinedRowGUI;
             public Action<int[]> CombinedSelection;
+            public Action CombinedExpanded;
+            public Action<int> CombinedDoubleClick;
             public bool LastSkipHiddenPackages;
-            public EventCallback<PointerUpEvent> OnPointerUp;
-            public EventCallback<PointerDownEvent> OnPointerDown;
             public EventCallback<ClickEvent> OnClick;
         }
 
@@ -69,8 +71,9 @@ namespace DeclutterAssets.Editor
             // If active tree instance changed (e.g. view mode toggle between one-column and two-column)
             if (binding.FolderTree != activeTree)
             {
-                binding.FolderTree = activeTree;
-                DeclutterAssetsTreePatcher.PatchTree(activeTree, forceRepatch: true);
+                UnhookVisualElement(binding);
+                binding = HookBrowser(binding.Window, activeTree);
+                s_Bindings[binding.Window] = binding;
                 return;
             }
 
@@ -99,12 +102,14 @@ namespace DeclutterAssets.Editor
                 var root = binding.Window.rootVisualElement;
                 if (root == null) return;
 
-                binding.OnPointerUp = (evt) => CheckAndPatchSingleBinding(binding);
-                binding.OnPointerDown = (evt) => CheckAndPatchSingleBinding(binding);
-                binding.OnClick = (evt) => CheckAndPatchSingleBinding(binding);
+                binding.OnClick = (evt) =>
+                {
+                    // Ignore clicks within IMGUIContainer (tree view, list area)
+                    // so we do not disrupt IMGUI double-click timing or selection
+                    if (evt.target is IMGUIContainer) return;
+                    CheckAndPatchSingleBinding(binding);
+                };
 
-                root.RegisterCallback(binding.OnPointerUp);
-                root.RegisterCallback(binding.OnPointerDown);
                 root.RegisterCallback(binding.OnClick);
             }
             catch (Exception ex)
@@ -122,10 +127,6 @@ namespace DeclutterAssets.Editor
                 var root = binding.Window.rootVisualElement;
                 if (root == null) return;
 
-                if (binding.OnPointerUp != null)
-                    root.UnregisterCallback(binding.OnPointerUp);
-                if (binding.OnPointerDown != null)
-                    root.UnregisterCallback(binding.OnPointerDown);
                 if (binding.OnClick != null)
                     root.UnregisterCallback(binding.OnClick);
             }
@@ -217,6 +218,46 @@ namespace DeclutterAssets.Editor
             var originalSelection = DeclutterAssetsUtility.GetSelectionChangedCallback(folderTree);
             Action<int[]> hookedSelection = (selectedIDs) =>
             {
+                TreeViewState state = DeclutterAssetsUtility.GetTreeState(folderTree);
+                int assetsId = DeclutterAssetsTreePatcher.GetAssetsFolderId();
+                bool wasAssetsExpanded = state != null && state.expandedIDs != null && state.expandedIDs.Contains(assetsId);
+
+                bool isImportSelection = false;
+                if (selectedIDs != null && selectedIDs.Length > 0)
+                {
+                    int selId = selectedIDs[0];
+                    if (selId == DeclutterAssetsUtility.IMPORTS_ROOT_ID)
+                    {
+                        isImportSelection = true;
+                    }
+                    else
+                    {
+                        string path = AssetDatabase.GetAssetPath(selId);
+                        if (!string.IsNullOrEmpty(path))
+                        {
+                            if (DeclutterAssetsSettings.Instance.IsImport(path))
+                            {
+                                isImportSelection = true;
+                            }
+
+                            // If a file was selected in the tree, select it in Unity's global selection
+                            if (File.Exists(path))
+                            {
+                                var fileObj = AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(path);
+                                if (fileObj != null)
+                                {
+                                    Selection.activeObject = fileObj;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (isImportSelection && !wasAssetsExpanded)
+                {
+                    DeclutterAssetsTreePatcher.SuppressAssetsExpansion = true;
+                }
+
                 try
                 {
                     originalSelection?.Invoke(selectedIDs);
@@ -228,8 +269,77 @@ namespace DeclutterAssets.Editor
                     dragDrop.HandleSelectionChanged(selectedIDs);
                 }
                 catch { }
+                finally
+                {
+                    if (isImportSelection && !wasAssetsExpanded)
+                    {
+                        DeclutterAssetsTreePatcher.SuppressAssetsExpansion = false;
+                        if (state != null && state.expandedIDs != null && state.expandedIDs.Contains(assetsId))
+                        {
+                            state.expandedIDs.Remove(assetsId);
+                            DeclutterAssetsTreePatcher.PatchTree(folderTree, forceRepatch: true);
+                            DeclutterAssetsUtility.RepaintFolderTree(folderTree);
+                        }
+                    }
+                }
             };
             DeclutterAssetsUtility.SetSelectionChangedCallback(folderTree, hookedSelection);
+
+            var originalExpanded = DeclutterAssetsUtility.GetExpandedStateChangedCallback(folderTree);
+            Action hookedExpanded = () =>
+            {
+                try
+                {
+                    originalExpanded?.Invoke();
+                }
+                catch { }
+
+                try
+                {
+                    DeclutterAssetsTreePatcher.PatchTree(folderTree, forceRepatch: true);
+                }
+                catch { }
+            };
+            DeclutterAssetsUtility.SetExpandedStateChangedCallback(folderTree, hookedExpanded);
+
+            var originalDoubleClick = DeclutterAssetsUtility.GetItemDoubleClickedCallback(folderTree);
+            Action<int> hookedDoubleClick = (clickedId) =>
+            {
+                try
+                {
+                    originalDoubleClick?.Invoke(clickedId);
+                }
+                catch { }
+
+                if (clickedId != 0 && clickedId != DeclutterAssetsUtility.IMPORTS_ROOT_ID)
+                {
+                    string path = AssetDatabase.GetAssetPath(clickedId);
+                    if (!string.IsNullOrEmpty(path))
+                    {
+                        if (File.Exists(path))
+                        {
+                            var assetObj = AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(path);
+                            if (assetObj != null)
+                            {
+                                AssetDatabase.OpenAsset(assetObj);
+                            }
+                        }
+                        else if (Directory.Exists(path) || AssetDatabase.IsValidFolder(path))
+                        {
+                            int viewMode = DeclutterAssetsUtility.GetViewMode(window);
+                            if (viewMode == 1)
+                            {
+                                try
+                                {
+                                    DeclutterAssetsUtility.ShowFolderContents(window, clickedId, false);
+                                }
+                                catch { }
+                            }
+                        }
+                    }
+                }
+            };
+            DeclutterAssetsUtility.SetItemDoubleClickedCallback(folderTree, hookedDoubleClick);
 
             object treeData = DeclutterAssetsUtility.GetTreeData(folderTree);
             if (treeData != null)
@@ -247,6 +357,8 @@ namespace DeclutterAssets.Editor
                 DragDrop = dragDrop,
                 CombinedRowGUI = hookedRowGUI,
                 CombinedSelection = hookedSelection,
+                CombinedExpanded = hookedExpanded,
+                CombinedDoubleClick = hookedDoubleClick,
                 LastSkipHiddenPackages = DeclutterAssetsUtility.GetSkipHiddenPackages(window)
             };
 
@@ -258,6 +370,7 @@ namespace DeclutterAssets.Editor
 
         private static void OnProjectChanged()
         {
+            DeclutterAssetsTreePatcher.ClearCache();
             foreach (var binding in s_Bindings.Values)
             {
                 if (binding.FolderTree != null)

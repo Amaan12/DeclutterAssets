@@ -31,6 +31,10 @@ namespace DeclutterAssets.Editor
         private static FieldInfo s_OnGUIRowCallbackField;
         private static PropertyInfo s_SelectionChangedCallbackProp;
         private static FieldInfo s_SelectionChangedCallbackField;
+        private static PropertyInfo s_ExpandedStateChangedProp;
+        private static FieldInfo s_ExpandedStateChangedField;
+        private static PropertyInfo s_ItemDoubleClickedCallbackProp;
+        private static FieldInfo s_ItemDoubleClickedCallbackField;
 
         private static Type s_TreeViewDataSourceType;
         private static FieldInfo s_RootItemField;
@@ -39,6 +43,11 @@ namespace DeclutterAssets.Editor
         private static MethodInfo s_SetExpandedMethod;
         private static MethodInfo s_IsExpandedMethod;
         private static FieldInfo s_OnVisibleRowsChangedField;
+
+        private static Type s_AssetsTreeViewDataSourceType;
+        private static FieldInfo s_RootsTreeViewItemField;
+        private static PropertyInfo s_FoldersOnlyProp;
+        private static FieldInfo s_FoldersOnlyField;
 
         private static Type s_RootTreeItemType;
         private static Texture2D s_ImportsFolderIcon;
@@ -93,10 +102,20 @@ namespace DeclutterAssets.Editor
                     s_SetSelectionMethod = s_TreeViewControllerType.GetMethod("SetSelection", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic, null, new[] { typeof(int[]), typeof(bool) }, null);
 
                     s_OnGUIRowCallbackProp = s_TreeViewControllerType.GetProperty("onGUIRowCallback", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-                    s_OnGUIRowCallbackField = s_TreeViewControllerType.GetField("<onGUIRowCallback>k__BackingField", BindingFlags.Instance | BindingFlags.NonPublic);
+                    s_OnGUIRowCallbackField = s_TreeViewControllerType.GetField("onGUIRowCallback", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                        ?? s_TreeViewControllerType.GetField("<onGUIRowCallback>k__BackingField", BindingFlags.Instance | BindingFlags.NonPublic);
 
                     s_SelectionChangedCallbackProp = s_TreeViewControllerType.GetProperty("selectionChangedCallback", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-                    s_SelectionChangedCallbackField = s_TreeViewControllerType.GetField("<selectionChangedCallback>k__BackingField", BindingFlags.Instance | BindingFlags.NonPublic);
+                    s_SelectionChangedCallbackField = s_TreeViewControllerType.GetField("selectionChangedCallback", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                        ?? s_TreeViewControllerType.GetField("<selectionChangedCallback>k__BackingField", BindingFlags.Instance | BindingFlags.NonPublic);
+
+                    s_ExpandedStateChangedProp = s_TreeViewControllerType.GetProperty("expandedStateChanged", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                    s_ExpandedStateChangedField = s_TreeViewControllerType.GetField("expandedStateChanged", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                        ?? s_TreeViewControllerType.GetField("<expandedStateChanged>k__BackingField", BindingFlags.Instance | BindingFlags.NonPublic);
+
+                    s_ItemDoubleClickedCallbackProp = s_TreeViewControllerType.GetProperty("itemDoubleClickedCallback", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                    s_ItemDoubleClickedCallbackField = s_TreeViewControllerType.GetField("itemDoubleClickedCallback", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                        ?? s_TreeViewControllerType.GetField("<itemDoubleClickedCallback>k__BackingField", BindingFlags.Instance | BindingFlags.NonPublic);
                 }
 
                 s_TreeViewDataSourceType = FindTypeInLoadedAssemblies("UnityEditor.IMGUI.Controls.TreeViewDataSource");
@@ -108,6 +127,15 @@ namespace DeclutterAssets.Editor
                     s_SetExpandedMethod = s_TreeViewDataSourceType.GetMethod("SetExpanded", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic, null, new[] { typeof(int), typeof(bool) }, null);
                     s_IsExpandedMethod = s_TreeViewDataSourceType.GetMethod("IsExpanded", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic, null, new[] { typeof(int) }, null);
                     s_OnVisibleRowsChangedField = s_TreeViewDataSourceType.GetField("onVisibleRowsChanged", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+                }
+
+                s_AssetsTreeViewDataSourceType = FindTypeInLoadedAssemblies("UnityEditor.AssetsTreeViewDataSource");
+                if (s_AssetsTreeViewDataSourceType != null)
+                {
+                    s_RootsTreeViewItemField = s_AssetsTreeViewDataSourceType.GetField("m_RootsTreeViewItem", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+                    s_FoldersOnlyProp = s_AssetsTreeViewDataSourceType.GetProperty("foldersOnly", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                    s_FoldersOnlyField = s_AssetsTreeViewDataSourceType.GetField("foldersOnly", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                        ?? s_AssetsTreeViewDataSourceType.GetField("m_FoldersOnly", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
                 }
 
                 s_RootTreeItemType = FindTypeInLoadedAssemblies("UnityEditor.AssetsTreeViewDataSource+RootTreeItem");
@@ -126,18 +154,53 @@ namespace DeclutterAssets.Editor
         {
             if (projectBrowser == null) return null;
 
-            object tree = null;
-            if (s_FolderTreeField != null)
+            int viewMode = GetViewMode(projectBrowser);
+            if (viewMode == 0) // One-Column mode uses m_AssetTree
             {
-                tree = s_FolderTreeField.GetValue(projectBrowser);
+                if (s_AssetTreeField != null)
+                {
+                    var tree = s_AssetTreeField.GetValue(projectBrowser);
+                    if (tree != null) return tree;
+                }
+                if (s_FolderTreeField != null)
+                {
+                    var tree = s_FolderTreeField.GetValue(projectBrowser);
+                    if (tree != null) return tree;
+                }
+            }
+            else // Two-Column mode (or fallback) uses m_FolderTree
+            {
+                if (s_FolderTreeField != null)
+                {
+                    var tree = s_FolderTreeField.GetValue(projectBrowser);
+                    if (tree != null) return tree;
+                }
+                if (s_AssetTreeField != null)
+                {
+                    var tree = s_AssetTreeField.GetValue(projectBrowser);
+                    if (tree != null) return tree;
+                }
             }
 
-            if (tree == null && s_AssetTreeField != null)
-            {
-                tree = s_AssetTreeField.GetValue(projectBrowser);
-            }
+            return null;
+        }
 
-            return tree;
+        public static bool IsFoldersOnly(object treeData)
+        {
+            if (treeData == null) return true;
+            try
+            {
+                if (s_FoldersOnlyProp != null)
+                {
+                    return (bool)s_FoldersOnlyProp.GetValue(treeData);
+                }
+                if (s_FoldersOnlyField != null)
+                {
+                    return (bool)s_FoldersOnlyField.GetValue(treeData);
+                }
+            }
+            catch { }
+            return true;
         }
 
         public static int GetViewMode(EditorWindow projectBrowser)
@@ -291,6 +354,58 @@ namespace DeclutterAssets.Editor
                 s_SelectionChangedCallbackProp.SetValue(folderTree, callback);
             else if (s_SelectionChangedCallbackField != null)
                 s_SelectionChangedCallbackField.SetValue(folderTree, callback);
+        }
+
+        public static Action GetExpandedStateChangedCallback(object folderTree)
+        {
+            if (folderTree == null) return null;
+            if (s_ExpandedStateChangedProp != null)
+                return s_ExpandedStateChangedProp.GetValue(folderTree) as Action;
+            if (s_ExpandedStateChangedField != null)
+                return s_ExpandedStateChangedField.GetValue(folderTree) as Action;
+            return null;
+        }
+
+        public static void SetExpandedStateChangedCallback(object folderTree, Action callback)
+        {
+            if (folderTree == null) return;
+            if (s_ExpandedStateChangedProp != null && s_ExpandedStateChangedProp.CanWrite)
+                s_ExpandedStateChangedProp.SetValue(folderTree, callback);
+            else if (s_ExpandedStateChangedField != null)
+                s_ExpandedStateChangedField.SetValue(folderTree, callback);
+        }
+
+        public static Action<int> GetItemDoubleClickedCallback(object folderTree)
+        {
+            if (folderTree == null) return null;
+            if (s_ItemDoubleClickedCallbackProp != null)
+                return s_ItemDoubleClickedCallbackProp.GetValue(folderTree) as Action<int>;
+            if (s_ItemDoubleClickedCallbackField != null)
+                return s_ItemDoubleClickedCallbackField.GetValue(folderTree) as Action<int>;
+            return null;
+        }
+
+        public static void SetItemDoubleClickedCallback(object folderTree, Action<int> callback)
+        {
+            if (folderTree == null) return;
+            if (s_ItemDoubleClickedCallbackProp != null && s_ItemDoubleClickedCallbackProp.CanWrite)
+                s_ItemDoubleClickedCallbackProp.SetValue(folderTree, callback);
+            else if (s_ItemDoubleClickedCallbackField != null)
+                s_ItemDoubleClickedCallbackField.SetValue(folderTree, callback);
+        }
+
+        public static void RegisterImportsRootInDataSource(object treeData, TreeViewItem importsItem)
+        {
+            if (treeData == null || importsItem == null || s_RootsTreeViewItemField == null) return;
+            try
+            {
+                var dict = s_RootsTreeViewItemField.GetValue(treeData) as System.Collections.IDictionary;
+                if (dict != null)
+                {
+                    dict["Imports"] = importsItem;
+                }
+            }
+            catch { }
         }
 
         public static void HookOnVisibleRowsChanged(object treeData, Action callback)
