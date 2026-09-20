@@ -1,3 +1,3 @@
 # DeclutterAssets
 
-Supported only in 6.0-6.3
+Supported only in Unity 6.0-6.3
